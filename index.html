@@ -794,6 +794,7 @@ body.locked .authgate{display:block}
       </div>
     </div>
     <div class="modal-foot">
+      <button class="btn" id="btn-portal" type="button" hidden>🔐 통합 로그인으로</button>
       <button class="btn btn-danger" id="btn-logout" type="button">로그아웃</button>
       <button class="btn" id="acc-close2" type="button">닫기</button>
     </div>
@@ -1107,6 +1108,39 @@ function clearSession(){
   LS.remove(SKEY);
 }
 
+/* ===== 통합 로그인 포털(SSO) =====
+   포털(같은 출처)에서 로그인했으면 다시 묻지 않고 이어서 연다.
+   이 앱에서 로그아웃하면 포털 세션과 세 앱의 세션을 함께 정리한다. */
+var PSso = 'kd.portal.sso.v1';
+var PApps = ['kd.session.v1','kd.session.tmp.v1','kdw.session.v1','kdw.session.tmp.v1','att.session.v1','att.session.tmp.v1'];
+function portalSSO(){
+  var s = null;
+  try{ s = JSON.parse(window.localStorage.getItem(PSso) || 'null'); }catch(e){ s = null; }
+  if(!s || !s.userId) return null;
+  if(s.exp && Date.now() > s.exp){ LS.remove(PSso); return null; }
+  return s;
+}
+function readPortalSSO(){
+  var s = portalSSO();
+  if(!s) return null;
+  var u = findUser(s.userId);
+  if(!u) return null;
+  writeSession(u, s.keep !== false);
+  return u;
+}
+function clearPortalSSO(){
+  if(!portalSSO()) return;
+  for(var i=0;i<PApps.length;i++){
+    try{ window.localStorage.removeItem(PApps[i]); }catch(e){}
+    try{ window.sessionStorage.removeItem(PApps[i]); }catch(e){}
+  }
+  LS.remove(PSso);
+}
+function portalHome(){
+  var s = portalSSO();
+  return (s && s.portal) ? s.portal : '../portal/';
+}
+
 /* ===== 로그인 / 로그아웃 ===== */
 function tryLogin(id, pw, keep){
   var u = findUser(id);
@@ -1118,6 +1152,7 @@ function tryLogin(id, pw, keep){
 }
 function logout(){
   clearSession();
+  clearPortalSSO();
   CUR = null;
   closeAccount();
   closeUsers();
@@ -2588,6 +2623,8 @@ function renderAccount(){
   $('#acc-name').textContent = CUR.name || CUR.id;
   $('#acc-role').textContent = isAdmin() ? '관리자' : '직원';
   $('#acc-admin-row').hidden = !isAdmin();
+  var bp = $('#btn-portal');
+  if(bp) bp.hidden = !(isAdmin() && portalSSO());
   var note = $('#acc-note');
   if(CUR.mustChange){
     note.hidden = false;
@@ -2736,6 +2773,7 @@ function bindAuth(){
   $('#acc-close2').addEventListener('click', closeAccount);
   ui.accountModal.addEventListener('click', function(ev){ if(ev.target === ui.accountModal) closeAccount(); });
   $('#btn-logout').addEventListener('click', logout);
+  $('#btn-portal').addEventListener('click', function(){ location.href = portalHome(); });
   $('#btn-users-open').addEventListener('click', function(){ closeAccount(); openUsers(); });
   $('#btn-invite-all').addEventListener('click', function(){ inviteCopy(null, '전체 직원 초대 링크를 복사했습니다'); });
   $('#btn-pw-change').addEventListener('click', function(){
@@ -2766,7 +2804,7 @@ bindEvents();
 bindAuth();
 document.documentElement.setAttribute('data-auth-ready', '1');
 var inviteResult = handleInviteHash();
-var sessionUser = readSession();
+var sessionUser = readSession() || readPortalSSO();
 if(sessionUser){
   startApp(sessionUser);
   if(inviteResult && inviteResult.added && inviteResult.added.length){
