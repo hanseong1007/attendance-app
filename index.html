@@ -2057,9 +2057,9 @@ function selectStatus(status, setTimes){
   });
   ui.recTimeGroup.hidden = !def.time;
   if(def.time && setTimes){
-    if(def.k === '반차(오전)'){ ui.recIn.value = '09:00'; ui.recOut.value = '13:00'; }
-    else if(def.k === '반차(오후)'){ ui.recIn.value = '13:00'; ui.recOut.value = '18:00'; }
-    else if(!ui.recIn.value && !ui.recOut.value){ ui.recIn.value = '09:00'; ui.recOut.value = '18:00'; }
+    if(def.k === '반차(오전)'){ ui.recIn.value = '08:30'; ui.recOut.value = '13:00'; }
+    else if(def.k === '반차(오후)'){ ui.recIn.value = '13:00'; ui.recOut.value = '17:30'; }
+    else if(!ui.recIn.value && !ui.recOut.value){ ui.recIn.value = '08:30'; ui.recOut.value = '17:30'; }
   }
 }
 
@@ -2091,8 +2091,8 @@ function openRecord(id){
     ui.recordTitle.textContent = '근태 입력';
     delete ui.recordModal.dataset.id;
     ui.recDate.value = todayISO();
-    ui.recIn.value = '09:00';
-    ui.recOut.value = '18:00';
+    ui.recIn.value = '08:30';
+    ui.recOut.value = '17:30';
     ui.recMemo.value = '';
     selectStatus('출근', false);
     ui.recDelete.hidden = true;
