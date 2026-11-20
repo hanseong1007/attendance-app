@@ -281,6 +281,8 @@ svg.ic{width:20px;height:20px;flex:0 0 auto;fill:none;stroke:currentColor;stroke
   animation:toastin .18s ease-out;
 }
 .toast[hidden]{display:none}
+/* 모달이 열려 있으면 토스트는 위로 올라가 모달 버튼을 가리지 않는다 */
+body:has(.modal:not([hidden])) .toast{bottom:auto;top:calc(14px + env(safe-area-inset-top,0px))}
 @keyframes toastin{from{opacity:0;transform:translate(-50%,8px)}to{opacity:1;transform:translate(-50%,0)}}
 
 /* ---------- responsive ---------- */
