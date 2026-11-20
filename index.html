@@ -1135,6 +1135,8 @@ function clearPortalSSO(){
     try{ window.sessionStorage.removeItem(PApps[i]); }catch(e){}
   }
   LS.remove(PSso);
+  LS.remove('kd.portal.session.v1');
+  try{ window.sessionStorage.removeItem('kd.portal.session.tmp.v1'); }catch(e){}
 }
 function portalHome(){
   var s = portalSSO();
