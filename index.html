@@ -1400,6 +1400,8 @@ function syncApplyRec(rec, id){
     d.users.push(u); changed = true;
   }
   var name = String(rec.name || id).slice(0, 20);
+  /* '관리자' 는 앱이 쓰는 기본 자리표시 이름 — 시트가 그 이름으로 덮여 있어도 실제 이름을 지우지 않는다 */
+  if(id === 'admin' && name === '관리자' && u.name && u.name !== '관리자') name = u.name;
   if(u.name !== name){ u.name = name; changed = true; }
   var ar = (id === 'admin') ? 'all' : (rec.apprRole === 'chief' || rec.apprRole === 'ceo' || rec.apprRole === 'all') ? rec.apprRole : 'staff';
   if(u.sheetApprRole !== ar){ u.sheetApprRole = ar; changed = true; }
