@@ -388,6 +388,7 @@ body.locked .authgate{display:block}
 .keep input{width:18px;height:18px;accent-color:var(--brand);margin:0}
 .authmsg{min-height:17px;font-size:12.5px;font-weight:700;color:var(--danger);margin-top:8px;line-height:1.45}
 .authmsg.ok{color:var(--brand-dark)}
+.syncnote{font-size:11.5px;font-weight:600;color:#6b7280;text-align:center;margin-top:6px;line-height:1.45}
 .authbtn{
   width:100%;min-height:52px;margin-top:10px;border:0;border-radius:14px;
   background:linear-gradient(150deg,#4a6bf0,#2c46b4);color:#fff;font-size:16px;font-weight:800;
@@ -465,6 +466,7 @@ body.locked .authgate{display:block}
         <label class="keep"><input type="checkbox" id="login-keep" checked> 로그인 유지</label>
         <button class="authlink" id="btn-pw-help" type="button" style="width:auto;margin:0">비밀번호를 잊었으면</button>
       </div>
+      <div class="syncnote" id="syncNote" role="status" aria-live="polite" hidden></div>
       <div class="authmsg" id="login-msg" role="status" aria-live="polite"></div>
       <button class="authbtn" id="login-btn" type="submit">로그인</button>
       <p class="authfoot">계정과 자료는 이 기기(브라우저)에만 저장됩니다<br>관리자가 만든 계정으로 로그인하세요</p>
@@ -1147,9 +1149,14 @@ function portalHome(){
 function tryLogin(id, pw, keep){
   var u = findUser(id);
   if(!u) return { ok:false, msg:'아이디 또는 비밀번호가 맞지 않습니다' };
-  if(!u.salt || hashPw(pw, u.salt) !== u.hash) return { ok:false, msg:'아이디 또는 비밀번호가 맞지 않습니다' };
+  if(u.active === false) return { ok:false, msg:'사용이 중지된 계정입니다 · 관리자에게 문의하세요' };
+  // 이 기기 해시 → 시트에 실린 공용 해시(네 앱 공통) 순서로 비밀번호를 확인한다
+  var v = syncCheckPassword(u, pw);
+  if(!v.ok) return { ok:false, msg:'아이디 또는 비밀번호가 맞지 않습니다' };
+  if(v.adopt) u = syncAdopt(u, pw, v.salt) || u;
   var k = unlockSeedForUser(u, pw);       // 예시 자료 열쇠를 푼다 (못 풀면 잠긴 채로 남는다)
   writeSession(u, keep);
+  if(v.adopt || v.heal) syncSelfHeal(u, pw, true);
   return { ok:true, user:u, locked:!k };
 }
 function logout(){
@@ -1233,6 +1240,296 @@ function handleInviteHash(){
   return res;
 }
 
+/* ===== 공용 계정 동기화 (구글 시트) ===== */
+/* ============================================================
+   공용 계정 동기화 — 구글 시트(Apps Script `portal_users`)
+   근태 앱 단독으로 접속해도 업무일지·포털·발주와 같은 아이디·비밀번호·이름·
+   결재 권한을 쓴다. 시트에는 salt·해시만 올린다.
+   저장 형식: { v:1, updatedAt:'yyyy-MM-dd HH:mm:ss', kcat:'…', users:[…] }
+   ============================================================ */
+var SYNC_URL = 'https://script.google.com/macros/s/AKfycbx8vtZ9wxfqwEUhuIC5hhV5dncN7IbVmrbjbPS93hfibfXAxMpwx-YtCGiqHeZXfEY81Q/exec';
+var SYNC_APP = 'att';
+var SYNC_PFX = { kdw:'wl1|', kd:'kd1|', att:'att1|', portal:'p1|' };
+var SYNC_AT_KEY = 'att.sheet.syncat.v1';
+var SYNC_KCAT_KEY = 'kd.sheet.kcat.v1';
+var SYNC_DIRTY_KEY = 'att.sheet.dirty.v1';
+var SHEET_SYNC = { state:'idle', at:'', error:'', promise:null, seed:false, last:0, hasDoc:false };
+
+function syncHash(app, pw, salt){ return sha256hex(SYNC_PFX[app] + salt + '|' + String(pw)); }
+function syncNote(txt){
+  var el = document.getElementById('syncNote');
+  if(!el) return;
+  el.textContent = txt || '';
+  el.hidden = !txt;
+}
+function syncStateNote(){
+  if(SHEET_SYNC.state === 'loading') syncNote('계정 정보 불러오는 중…');
+  else if(SHEET_SYNC.state === 'error') syncNote('계정 정보를 못 불러왔어요 · 이 기기에 저장된 계정으로 로그인할 수 있습니다');
+  else syncNote('');
+}
+function syncFetch(payload){
+  return fetch(SYNC_URL, {
+    method:'POST', cache:'no-store', redirect:'follow',
+    headers:{ 'Content-Type':'text/plain;charset=utf-8' },
+    body: JSON.stringify(payload)
+  }).then(function(r){
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    return r.text();
+  }).then(function(t){
+    var j = null;
+    try{ j = JSON.parse(t); }catch(e){ throw new Error('시트 응답을 읽지 못했습니다'); }
+    if(!j || j.ok !== true) throw new Error((j && (j.error || j.message)) || '시트가 요청을 처리하지 못했습니다');
+    return j;
+  });
+}
+
+function syncRecordOf(u){
+  var salt = u.sheetSalt || u.salt || '';
+  var hs = {}, any = false, k;
+  if(u.sheetHashes && typeof u.sheetHashes === 'object'){
+    for(k in u.sheetHashes){ if(SYNC_PFX[k] && u.sheetHashes[k]){ hs[k] = String(u.sheetHashes[k]); any = true; } }
+  }
+  if(!hs[SYNC_APP] && salt && u.hash && (!u.sheetSalt || u.sheetSalt === u.salt)){ hs[SYNC_APP] = u.hash; any = true; }
+  var ar = (u.id === 'admin') ? 'all' : (u.sheetApprRole || u.apprRole || 'staff');
+  if(ar !== 'chief' && ar !== 'ceo') ar = (u.id === 'admin' ? 'all' : 'staff');
+  var rec = { id:u.id, name:u.name || u.id, role:(u.id === 'admin' ? 'admin' : 'user'),
+              apprRole: ar, salt:salt, hash:(hs[SYNC_APP] || ''),
+              active:(u.active !== false), mustChange:(u.mustChange === true),
+              createdAt:(u.createdAt || 0), hashApp:SYNC_APP };
+  if(any) rec.hashes = hs;
+  return rec;
+}
+function syncLocalDoc(){
+  var d = usersDoc(), users = [];
+  d.users.forEach(function(u){ if(u && u.id) users.push(syncRecordOf(u)); });
+  return { v:1, updatedAt:'', kcat:(LS.get(SYNC_KCAT_KEY, '') || ''), users:users };
+}
+function syncSaveCreds(u, pw){
+  if(!u || !pw) return u;
+  var salt = u.salt || newSalt(), hs = {}, k;
+  for(k in SYNC_PFX) hs[k] = syncHash(k, pw, salt);
+  u.salt = salt; u.hash = hs[SYNC_APP]; u.sheetSalt = salt; u.sheetHashes = hs;
+  return u;
+}
+function syncSetCredsById(id, pw){
+  if(!id || !pw) return null;
+  var d = usersDoc(), hit = null, k, hs, salt;
+  d.users.forEach(function(u){ if(u.id === id) hit = u; });
+  if(!hit) return null;
+  salt = hit.salt || newSalt();
+  hs = {};
+  for(k in SYNC_PFX) hs[k] = syncHash(k, pw, salt);
+  hit.salt = salt; hit.hash = hs[SYNC_APP]; hit.sheetSalt = salt; hit.sheetHashes = hs;
+  saveUsers(d);
+  return hit;
+}
+function syncMergeRec(sheet, loc){
+  var out = {}, k;
+  for(k in sheet) out[k] = sheet[k];
+  for(k in loc){ if(loc[k] !== undefined && loc[k] !== '') out[k] = loc[k]; }
+  if(sheet.salt && out.salt === sheet.salt && sheet.hashes){
+    var hs = {}, a;
+    for(a in sheet.hashes) hs[a] = sheet.hashes[a];
+    if(loc.hashes) for(a in loc.hashes) if(loc.hashes[a]) hs[a] = loc.hashes[a];
+    out.hashes = hs;
+  }else if(sheet.hashes && !out.hashes){ out.hashes = sheet.hashes; }
+  return out;
+}
+function syncMergeDoc(local){
+  return syncFetch({ action:'users_get' }).then(function(j){
+    var raw = String(j.usersJson || '').trim(), doc = null;
+    if(raw){ try{ doc = JSON.parse(raw); }catch(e){ doc = null; } }
+    if(!doc || !Array.isArray(doc.users)) return local;
+    var mine = {}, out = [], k;
+    local.users.forEach(function(r){ if(r && r.id) mine[r.id] = r; });
+    doc.users.forEach(function(r){
+      if(!r || !r.id) return;
+      if(mine[r.id]){ out.push(syncMergeRec(r, mine[r.id])); delete mine[r.id]; }
+      else out.push(r);
+    });
+    for(k in mine) out.push(mine[k]);
+    doc.users = out;
+    doc.v = 1;
+    if(local.kcat) doc.kcat = local.kcat;
+    return doc;
+  }).catch(function(){ return local; });
+}
+function pushUsersToSheet(opts){
+  opts = opts || {};
+  var built = syncLocalDoc();
+  var chain = opts.id ? syncMergeDoc(built) : Promise.resolve(built);
+  return chain.then(function(doc){
+    return syncFetch({ action:'users_save', usersJson: JSON.stringify(doc) });
+  }).then(function(j){
+    SHEET_SYNC.state = 'done'; SHEET_SYNC.error = '';
+    SHEET_SYNC.at = String(j.updatedAt || '');
+    if(SHEET_SYNC.at) LS.set(SYNC_AT_KEY, SHEET_SYNC.at);
+    LS.set(SYNC_DIRTY_KEY, false);
+    syncStateNote();
+    return { ok:true, at:SHEET_SYNC.at, length:j.length };
+  }).catch(function(e){
+    SHEET_SYNC.state = 'error';
+    SHEET_SYNC.error = (e && e.message) || '시트에 올리지 못했습니다';
+    LS.set(SYNC_DIRTY_KEY, true);
+    syncStateNote();
+    return { ok:false, error:SHEET_SYNC.error };
+  });
+}
+function syncApplyRec(rec, id){
+  var d = usersDoc(), u = null, i, changed = false, k;
+  for(i=0;i<d.users.length;i++){ if(d.users[i].id === id){ u = d.users[i]; break; } }
+  if(!u){
+    u = { id:id, name:id, role:'user', salt:'', hash:'',
+          createdAt:Number(rec.createdAt) || Date.now(), mustChange:false };
+    d.users.push(u); changed = true;
+  }
+  var name = String(rec.name || id).slice(0, 20);
+  if(u.name !== name){ u.name = name; changed = true; }
+  var ar = (id === 'admin') ? 'all' : (rec.apprRole === 'chief' || rec.apprRole === 'ceo') ? rec.apprRole : 'staff';
+  if(u.sheetApprRole !== ar){ u.sheetApprRole = ar; changed = true; }
+  if(rec.active === false){ u.active = false; } else if('active' in u){ delete u.active; }
+  if(rec.mustChange !== undefined && (!!u.mustChange) !== (!!rec.mustChange)){ u.mustChange = !!rec.mustChange; changed = true; }
+  if(rec.salt) u.sheetSalt = String(rec.salt);
+  var hs = {}, any = false;
+  if(rec.hashes && typeof rec.hashes === 'object'){
+    for(k in rec.hashes){ if(SYNC_PFX[k] && rec.hashes[k]){ hs[k] = String(rec.hashes[k]); any = true; } }
+  }
+  if(rec.hash && SYNC_PFX[rec.hashApp] && !hs[rec.hashApp]){ hs[rec.hashApp] = String(rec.hash); any = true; }
+  if(any) u.sheetHashes = hs;
+  var mine = hs[SYNC_APP];
+  if(mine && rec.salt && (u.salt !== String(rec.salt) || u.hash !== mine)){
+    u.salt = String(rec.salt); u.hash = mine; changed = true;
+  }
+  if(changed) saveUsers(d);
+  return changed;
+}
+function syncApplyDoc(doc){
+  if(!doc || !Array.isArray(doc.users)) return 0;
+  var at = String(doc.updatedAt || '');
+  var last = String(LS.get(SYNC_AT_KEY, '') || '');
+  if(last && at && at < last) return 0;
+  var fresh = !last, applied = 0, known = {};
+  doc.users.forEach(function(rec){
+    var id = normId(rec && rec.id);
+    if(!id) return;
+    known[id] = 1;
+    if(syncApplyRec(rec, id)) applied++;
+  });
+  if(!fresh){
+    var d = usersDoc(), out = [], gone = 0;
+    d.users.forEach(function(u){ if(u.id === 'admin' || known[u.id]) out.push(u); else gone++; });
+    if(gone){ d.users = out; saveUsers(d); applied++; }
+  }
+  var kcat = String(doc.kcat || '');
+  if(kcat && /^[0-9a-f]{32}$/.test(kcat)) LS.set(SYNC_KCAT_KEY, kcat);   /* 발주 앱 품목 열쇠 — 이 앱은 보관만 한다 */
+  if(at) LS.set(SYNC_AT_KEY, at);
+  return applied;
+}
+function syncCanSeed(){
+  var d = usersDoc();
+  if(d.users.length >= 2) return true;
+  var a = findUser('admin');
+  if(!a || !a.salt || !a.hash) return false;
+  return hashPw(DEFAULT_ADMIN_PW, a.salt) !== a.hash;
+}
+function syncNeededBeforeLogin(){
+  if(SHEET_SYNC.promise) return true;
+  if(SHEET_SYNC.state === 'done') return false;
+  if(SHEET_SYNC.last && Date.now() - SHEET_SYNC.last < 60000) return false;
+  return true;
+}
+function syncAfterApply(res){
+  if(!res || !res.ok) return;
+  if(!CUR){
+    var s = portalSSO();
+    if(s && findUser(s.userId)){
+      var u2 = readPortalSSO();
+      if(u2){ var m = $('#login-msg'); if(m){ m.className = 'authmsg ok'; m.textContent = ''; } startApp(u2); }
+    }
+    return;
+  }
+  if(!res.applied) return;
+  var u = findUser(CUR.id);
+  if(!u){ logout(); return; }
+  CUR = u;
+  try{ renderAccount(); renderAccountChip(); }catch(e){}
+  try{ if(document.getElementById('users-list')) renderUsers(); }catch(e){}
+}
+function syncUsersFromSheet(opts){
+  opts = opts || {};
+  if(opts.seed) SHEET_SYNC.seed = true;
+  if(SHEET_SYNC.promise) return SHEET_SYNC.promise;
+  SHEET_SYNC.state = 'loading';
+  SHEET_SYNC.last = Date.now();
+  syncStateNote();
+  var wantSeed = SHEET_SYNC.seed;
+  var first = (LS.get(SYNC_DIRTY_KEY, false) === true)
+    ? pushUsersToSheet({ full:true }).then(function(){ return syncFetch({ action:'users_get' }); })
+    : syncFetch({ action:'users_get' });
+  var p = first.then(function(j){
+    var raw = String(j.usersJson || '').trim(), at = String(j.updatedAt || '');
+    SHEET_SYNC.state = 'done'; SHEET_SYNC.error = '';
+    if(!raw){
+      SHEET_SYNC.at = '';
+      if(wantSeed && syncCanSeed()){
+        SHEET_SYNC.seed = false;
+        return pushUsersToSheet({ full:true }).then(function(r){
+          return { ok:!!r.ok, seeded:!!r.ok, applied:0 };
+        });
+      }
+      return { ok:true, empty:true, applied:0 };
+    }
+    var doc = null;
+    try{ doc = JSON.parse(raw); }catch(e){ throw new Error('계정 목록 형식이 올바르지 않습니다'); }
+    SHEET_SYNC.hasDoc = true;
+    var applied = syncApplyDoc(doc);
+    SHEET_SYNC.at = String(doc.updatedAt || at || '');
+    return { ok:true, applied:applied, at:SHEET_SYNC.at };
+  }).catch(function(e){
+    SHEET_SYNC.state = 'error';
+    SHEET_SYNC.error = (e && e.message) || '시트에 연결하지 못했습니다';
+    return { ok:false, error:SHEET_SYNC.error };
+  }).then(function(r){
+    SHEET_SYNC.promise = null; SHEET_SYNC.seed = false;
+    syncStateNote();
+    return r;
+  });
+  SHEET_SYNC.promise = p;
+  return p;
+}
+function syncCheckPassword(u, pw){
+  if(!u || !pw) return { ok:false };
+  if(u.salt && u.hash && syncHash(SYNC_APP, pw, u.salt) === u.hash) return { ok:true, salt:u.salt };
+  var hs = u.sheetHashes || {}, salt = u.sheetSalt || '', app;
+  if(salt){
+    for(app in SYNC_PFX){
+      if(hs[app] && syncHash(app, pw, salt) === hs[app]) return { ok:true, salt:salt, adopt:true };
+    }
+  }
+  return { ok:false };
+}
+function syncAdopt(u, pw, salt){
+  if(!u || !pw || !salt) return u;
+  var d = usersDoc(), i, k;
+  for(i=0;i<d.users.length;i++){
+    if(d.users[i].id !== u.id) continue;
+    var x = d.users[i], hs = {};
+    for(k in SYNC_PFX) hs[k] = syncHash(k, pw, salt);
+    x.salt = salt; x.hash = hs[SYNC_APP]; x.sheetSalt = salt; x.sheetHashes = hs;
+  }
+  saveUsers(d);
+  return findUser(u.id);
+}
+function syncSelfHeal(u, pw, force){
+  if(!u || !pw) return Promise.resolve({ ok:false });
+  var salt = u.salt || newSalt(), hs = u.sheetHashes || {}, k, same = (u.sheetSalt === salt) && !force;
+  if(same){ for(k in SYNC_PFX){ if(hs[k] !== syncHash(k, pw, salt)){ same = false; break; } } }
+  if(same) return Promise.resolve({ ok:true, skipped:true });
+  syncAdopt(u, pw, salt);
+  if(!SHEET_SYNC.hasDoc && !syncCanSeed()) return Promise.resolve({ ok:false, skipped:true });
+  return pushUsersToSheet({ id:u.id });
+}
+
 /* ===== 사용자 관리 (관리자 전용) ===== */
 function addUser(id, name, pw){
   if(!isAdmin()) return { ok:false, msg:'관리자만 사용자를 추가할 수 있습니다' };
@@ -1245,6 +1542,7 @@ function addUser(id, name, pw){
   saveUsers(d);
   var u = findUser(nid);
   if(SEED.ok && u) saveSeedWrap(u, SEED.key);      // 이 기기에서는 바로 열 수 있게 열쇠도 감싸 둔다
+  if(u){ syncSetCredsById(nid, pw); u = findUser(nid); pushUsersToSheet({ full:true }); }
   return { ok:true, user:u };
 }
 function resetPassword(id, pw){
@@ -1256,8 +1554,10 @@ function resetPassword(id, pw){
   for(var i=0;i<d.users.length;i++){ if(d.users[i].id === nid){ hit = d.users[i]; break; } }
   if(!hit) return { ok:false, msg:'없는 사용자입니다' };
   hit.salt = newSalt(); hit.hash = hashPw(pw, hit.salt); hit.mustChange = true;
+  syncSaveCreds(hit, pw);
   saveUsers(d);
   if(SEED.ok) saveSeedWrap(findUser(nid), SEED.key);
+  pushUsersToSheet({ full:true });
   return { ok:true, msg:(hit.name || nid) + ' 비밀번호를 바꿨습니다' };
 }
 function deleteUser(id){
@@ -1268,6 +1568,7 @@ function deleteUser(id){
   d.users.forEach(function(u){ if(u.id === nid) hit = u; else rest.push(u); });
   if(!hit) return { ok:false, msg:'없는 사용자입니다' };
   d.users = rest; saveUsers(d);
+  pushUsersToSheet({ full:true });
   try{
     var kill = [], p = 'att.u.' + nid + '.';
     for(var i=0;i<window.localStorage.length;i++){
@@ -1295,6 +1596,9 @@ function changeOwnPassword(curPw, newPw){
     saveSeedWrap(CUR, SEED.key);                  // 새 비밀번호(hash)에 맞춰 다시 감싼다
     if(CUR.id === 'admin') saveSeedPwWrap(CUR, SEED.key, newPw);
   }
+  syncSetCredsById(CUR.id, newPw);
+  CUR = findUser(CUR.id);
+  pushUsersToSheet({ id:CUR.id });                // 내 비밀번호는 시트에도 바로 반영한다
   return { ok:true, msg:'비밀번호를 바꿨습니다' };
 }
 
@@ -2656,6 +2960,7 @@ function openUsers(){
   if(!isAdmin()) return;
   renderUsers();
   ui.usersModal.hidden = false;
+  syncUsersFromSheet({ seed:true }).then(function(r){ if(r && (r.applied || r.seeded)) renderUsers(); });
 }
 function closeUsers(){ if(ui.usersModal) ui.usersModal.hidden = true; }
 function renderUsers(){
@@ -2758,12 +3063,25 @@ function bindAuth(){
     var id = $('#login-id').value, pw = $('#login-pw').value, keep = $('#login-keep').checked;
     var msg = $('#login-msg');
     if(!String(id).trim() || !pw){ msg.className = 'authmsg'; msg.textContent = '아이디와 비밀번호를 넣어 주세요'; return; }
-    var r = tryLogin(id, pw, keep);
-    if(!r.ok){ msg.className = 'authmsg'; msg.textContent = r.msg; $('#login-pw').value = ''; $('#login-pw').focus(); return; }
-    msg.className = 'authmsg ok'; msg.textContent = '';
-    startApp(r.user);
-    if(r.locked) toast('예시 자료가 잠겨 있습니다 · 관리자에게 새 초대 링크를 받아 주세요');
-    else if(r.user.mustChange) toast('처음 비밀번호입니다 · 내 계정에서 바꿔 주세요');
+    var run = function(afterSync){
+      var r = tryLogin(id, pw, keep);
+      if(!r.ok){
+        // 이 기기에 없거나 비밀번호가 안 맞으면, 시트에서 공용 계정을 한 번 받아 보고 다시 확인한다
+        if(!afterSync && syncNeededBeforeLogin()){
+          msg.className = 'authmsg ok'; msg.textContent = '계정 정보를 확인하는 중…';
+          syncUsersFromSheet({}).then(function(){ run(true); });
+          return;
+        }
+        msg.className = 'authmsg'; msg.textContent = r.msg; $('#login-pw').value = ''; $('#login-pw').focus(); return;
+      }
+      msg.className = 'authmsg ok'; msg.textContent = '';
+      startApp(r.user);
+      if(r.user.id === 'admin') syncSelfHeal(r.user, pw).then(function(){ return syncUsersFromSheet({ seed:true }); });
+      else syncSelfHeal(r.user, pw);
+      if(r.locked) toast('예시 자료가 잠겨 있습니다 · 관리자에게 새 초대 링크를 받아 주세요');
+      else if(r.user.mustChange) toast('처음 비밀번호입니다 · 내 계정에서 바꿔 주세요');
+    };
+    run(false);
   });
   $('#btn-pw-help').addEventListener('click', function(){
     var m = $('#login-msg');
@@ -2823,6 +3141,8 @@ if(sessionUser){
   }
   showGate(gateMsg);
 }
+// 공용 계정: 화면이 열리면 조용히 한 번 시트에서 계정을 받아 둔다
+syncUsersFromSheet({ seed: !!(sessionUser && sessionUser.id === 'admin') }).then(syncAfterApply);
 window.__attendance = {
   get state(){ return state; },
   get user(){ return CUR; },
@@ -2843,7 +3163,12 @@ window.__attendance = {
   refreshAutoAllowances: refreshAutoAllowances,
   leaveModeOf: leaveModeOf,
   makeCSV: makeCSV,
-  LS_KEY: LS_KEY
+  LS_KEY: LS_KEY,
+  sync: function(){ return { state:SHEET_SYNC.state, at:SHEET_SYNC.at, error:SHEET_SYNC.error, dirty:LS.get(SYNC_DIRTY_KEY, false) === true }; },
+  syncNow: syncUsersFromSheet,
+  pushSheet: pushUsersToSheet,
+  kcat: function(){ return LS.get(SYNC_KCAT_KEY, ''); },
+  creds: function(id){ var u = findUser(id); return u ? { salt:u.salt, hash:u.hash, sheetSalt:u.sheetSalt || '', hashes:u.sheetHashes || null } : null; }
 };
 })();
 </script>
