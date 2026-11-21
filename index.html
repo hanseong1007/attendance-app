@@ -1046,6 +1046,7 @@ function unlockSeedForUser(u, pw){
   var W, k = '';
   W = LS.get(seedWrapKeys(u.id).mat, null);
   if(W && W.salt && W.ct) k = unwrapKeyHex(W.ct, matKeyHex(W.salt, u.hash));
+  if(!k && W && W.salt && W.ct && u.prevHash) k = unwrapKeyHex(W.ct, matKeyHex(W.salt, u.prevHash));   /* 시트 계정으로 맞추기 전 비밀번호 */
   if(!k && u.id === 'admin' && pw) k = unwrapKeyHex(SEED_WRAP.ct, pwKeyHex(SEED_WRAP.salt, pw));
   if(!k && u.id === 'admin' && pw){
     W = LS.get(seedWrapKeys(u.id).pw, null);
@@ -1398,6 +1399,7 @@ function syncApplyRec(rec, id){
   if(any) u.sheetHashes = hs;
   var mine = hs[SYNC_APP];
   if(mine && rec.salt && (u.salt !== String(rec.salt) || u.hash !== mine)){
+    if(u.salt && u.hash){ u.prevSalt = u.salt; u.prevHash = u.hash; }   /* 이 기기 열쇠를 풀 수 있게 예전 것을 남긴다 */
     u.salt = String(rec.salt); u.hash = mine; changed = true;
   }
   if(changed) saveUsers(d);
@@ -1515,6 +1517,7 @@ function syncAdopt(u, pw, salt){
     if(d.users[i].id !== u.id) continue;
     var x = d.users[i], hs = {};
     for(k in SYNC_PFX) hs[k] = syncHash(k, pw, salt);
+    if(x.salt && x.hash && x.salt !== salt){ x.prevSalt = x.salt; x.prevHash = x.hash; }
     x.salt = salt; x.hash = hs[SYNC_APP]; x.sheetSalt = salt; x.sheetHashes = hs;
   }
   saveUsers(d);
