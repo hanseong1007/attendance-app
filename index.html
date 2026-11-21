@@ -1100,7 +1100,9 @@ function readSession(){
   return u || null;
 }
 function writeSession(u, keep){
-  var s = { userId: u.id, ts: Date.now() };
+  var s = { userId:u.id, ts:Date.now(), name:(u.name || u.id),
+            role:(u.id === 'admin' ? 'admin' : 'user'),
+            apprRole:(u.id === 'admin' ? 'all' : (u.sheetApprRole || u.apprRole || 'staff')) };
   try{ window.sessionStorage.removeItem(TKEY); }catch(e){}
   LS.remove(SKEY);
   if(keep){ LS.set(SKEY, s); }
@@ -1254,7 +1256,8 @@ var SYNC_PFX = { kdw:'wl1|', kd:'kd1|', att:'att1|', portal:'p1|' };
 var SYNC_AT_KEY = 'att.sheet.syncat.v1';
 var SYNC_KCAT_KEY = 'kd.sheet.kcat.v1';
 var SYNC_DIRTY_KEY = 'att.sheet.dirty.v1';
-var SHEET_SYNC = { state:'idle', at:'', error:'', promise:null, seed:false, last:0, hasDoc:false };
+var SHEET_SYNC = { state:'idle', at:'', error:'', promise:null, seed:false, last:0, hasDoc:false,
+                   acctAt:0, quiet:false };   /* acctAt = 로그인된 세션에서 조용히 확인한 시각(60초 스로틀) */
 
 function syncHash(app, pw, salt){ return sha256hex(SYNC_PFX[app] + salt + '|' + String(pw)); }
 function syncNote(txt){
@@ -1264,6 +1267,7 @@ function syncNote(txt){
   el.hidden = !txt;
 }
 function syncStateNote(){
+  if(SHEET_SYNC.quiet){ syncNote(''); return; }        /* 로그인된 세션의 조용한 확인 — 실패해도 무소음 */
   if(SHEET_SYNC.state === 'loading') syncNote('계정 정보 불러오는 중…');
   else if(SHEET_SYNC.state === 'error') syncNote('계정 정보를 못 불러왔어요 · 이 기기에 저장된 계정으로 로그인할 수 있습니다');
   else syncNote('');
@@ -1303,8 +1307,10 @@ function syncRecordOf(u){
 function syncLocalDoc(){
   var d = usersDoc(), users = [];
   d.users.forEach(function(u){ if(u && u.id) users.push(syncRecordOf(u)); });
-  return { v:1, updatedAt:'', kcat:(LS.get(SYNC_KCAT_KEY, '') || ''), users:users };
+  return { v:1, updatedAt:'', kcat:(LS.get(SYNC_KCAT_KEY, '') || ''), users:users, deletedIds:deletedIdsOf(d) };
 }
+/* admin 이 실제로 지운 계정 목록 — 시트에 함께 올려 다른 기기도 그 계정만 지우게 한다 */
+function deletedIdsOf(d){ return (d && Array.isArray(d.deletedIds)) ? d.deletedIds : []; }
 function syncSaveCreds(u, pw){
   if(!u || !pw) return u;
   var salt = u.salt || newSalt(), hs = {}, k;
@@ -1328,6 +1334,10 @@ function syncMergeRec(sheet, loc){
   var out = {}, k;
   for(k in sheet) out[k] = sheet[k];
   for(k in loc){ if(loc[k] !== undefined && loc[k] !== '') out[k] = loc[k]; }
+  /* 이름·권한은 시트가 기준 — 이 기기의 옛 이름('관리자')이 시트의 최신 이름('박한성')을 덮지 않는다 */
+  if(sheet.name) out.name = sheet.name;
+  if(sheet.role) out.role = sheet.role;
+  if(sheet.apprRole) out.apprRole = sheet.apprRole;
   if(sheet.salt && out.salt === sheet.salt && sheet.hashes){
     var hs = {}, a;
     for(a in sheet.hashes) hs[a] = sheet.hashes[a];
@@ -1352,6 +1362,11 @@ function syncMergeDoc(local){
     doc.users = out;
     doc.v = 1;
     if(local.kcat) doc.kcat = local.kcat;
+    /* 지운 계정 목록은 시트 것과 이 기기 것을 합쳐 둔다 */
+    var del = {};
+    (Array.isArray(doc.deletedIds) ? doc.deletedIds : []).forEach(function(x){ var id = normId(x); if(id) del[id] = 1; });
+    (Array.isArray(local.deletedIds) ? local.deletedIds : []).forEach(function(x){ var id = normId(x); if(id) del[id] = 1; });
+    doc.deletedIds = Object.keys(del);
     return doc;
   }).catch(function(){ return local; });
 }
@@ -1386,7 +1401,7 @@ function syncApplyRec(rec, id){
   }
   var name = String(rec.name || id).slice(0, 20);
   if(u.name !== name){ u.name = name; changed = true; }
-  var ar = (id === 'admin') ? 'all' : (rec.apprRole === 'chief' || rec.apprRole === 'ceo') ? rec.apprRole : 'staff';
+  var ar = (id === 'admin') ? 'all' : (rec.apprRole === 'chief' || rec.apprRole === 'ceo' || rec.apprRole === 'all') ? rec.apprRole : 'staff';
   if(u.sheetApprRole !== ar){ u.sheetApprRole = ar; changed = true; }
   if(rec.active === false){ u.active = false; } else if('active' in u){ delete u.active; }
   if(rec.mustChange !== undefined && (!!u.mustChange) !== (!!rec.mustChange)){ u.mustChange = !!rec.mustChange; changed = true; }
@@ -1418,9 +1433,23 @@ function syncApplyDoc(doc){
     if(syncApplyRec(rec, id)) applied++;
   });
   if(!fresh){
+    /* admin 이 deletedIds 에 넣어 실제로 지운 계정만 지운다 (시트에 없다는 이유로 로컬 계정을 지우지 않는다) */
+    var delIds = {};
+    (Array.isArray(doc.deletedIds) ? doc.deletedIds : []).forEach(function(x){ var n = normId(x); if(n && n !== 'admin') delIds[n] = 1; });
     var d = usersDoc(), out = [], gone = 0;
-    d.users.forEach(function(u){ if(u.id === 'admin' || known[u.id]) out.push(u); else gone++; });
+    d.users.forEach(function(u){
+      if(u.id === 'admin'){ out.push(u); return; }
+      if(delIds[u.id]){ gone++; return; }
+      out.push(u);
+    });
     if(gone){ d.users = out; saveUsers(d); applied++; }
+    if(Array.isArray(doc.deletedIds) && doc.deletedIds.length){
+      var d2 = usersDoc(), del = {};
+      deletedIdsOf(d2).forEach(function(x){ var n = normId(x); if(n) del[n] = 1; });
+      doc.deletedIds.forEach(function(x){ var n = normId(x); if(n) del[n] = 1; });
+      var ids = Object.keys(del);
+      if(ids.length !== deletedIdsOf(d2).length){ d2.deletedIds = ids; saveUsers(d2); }
+    }
   }
   var kcat = String(doc.kcat || '');
   if(kcat && /^[0-9a-f]{32}$/.test(kcat)) LS.set(SYNC_KCAT_KEY, kcat);   /* 발주 앱 품목 열쇠 — 이 앱은 보관만 한다 */
@@ -1450,16 +1479,64 @@ function syncAfterApply(res){
     }
     return;
   }
-  if(!res.applied) return;
+  /* 시트 이름·결재 권한이 이 기기 세션과 다르면 — 로그아웃 없이 바로 맞춘다 */
+  syncRefreshIdentity();
+}
+/* 세션 기록(session · kd.portal.sso.v1)에 남은 이름·권한을 시트 값으로 맞춘다 */
+function syncSessionLabels(u){
+  if(!u) return;
+  var nm = u.name || u.id, ro = (u.id === 'admin' ? 'admin' : 'user'),
+      ar = (u.id === 'admin' ? 'all' : (u.sheetApprRole || u.apprRole || 'staff')), s, k, ss;
+  try{ s = JSON.parse(window.sessionStorage.getItem(TKEY) || 'null'); }catch(e){ s = null; }
+  if(s && s.userId === u.id && (s.name !== nm || s.role !== ro || s.apprRole !== ar)){
+    s.name = nm; s.role = ro; s.apprRole = ar;
+    try{ window.sessionStorage.setItem(TKEY, JSON.stringify(s)); }catch(e){}
+  }
+  k = LS.get(SKEY, null);
+  if(k && k.userId === u.id && (k.name !== nm || k.role !== ro || k.apprRole !== ar)){
+    k.name = nm; k.role = ro; k.apprRole = ar; LS.set(SKEY, k);
+  }
+  ss = portalSSO();
+  if(ss && ss.userId === u.id && (ss.name !== nm || ss.role !== ro || ss.apprRole !== ar)){
+    ss.name = nm; ss.role = ro; ss.apprRole = ar; LS.set(PSso, ss);
+  }
+}
+/* 시트에서 받은 계정이 지금 세션과 다르면 — 로그아웃 없이 이름·권한을 바꾸고 화면을 다시 그린다 */
+function syncRefreshIdentity(){
+  if(!CUR) return false;
   var u = findUser(CUR.id);
-  if(!u){ logout(); return; }
+  if(!u) return false;
+  var arFormer = CUR.id === 'admin' ? 'all' : (CUR.sheetApprRole || CUR.apprRole || 'staff');
+  var arNow = u.id === 'admin' ? 'all' : (u.sheetApprRole || u.apprRole || 'staff');
+  var changed = ((CUR.name || CUR.id) !== (u.name || u.id)) ||
+                (arFormer !== arNow) ||
+                (CUR.role !== u.role) ||
+                ((CUR.active !== false) !== (u.active !== false));
   CUR = u;
-  try{ renderAccount(); renderAccountChip(); }catch(e){}
-  try{ if(document.getElementById('users-list')) renderUsers(); }catch(e){}
+  syncSessionLabels(u);
+  if(!changed) return false;
+  try{ renderAccount(); }catch(e){}
+  try{ renderAccountChip(); }catch(e){}
+  var ul = document.getElementById('users-list');
+  if(ul) renderUsers();
+  try{ renderAll(); }catch(e){}
+  return true;
+}
+/* 이미 로그인된 세션에서도 시트 계정을 조용히 한 번 확인한다 (60초 스로틀 · 실패 무소음) */
+function syncSessionAccount(){
+  if(!CUR) return Promise.resolve({ ok:false, skipped:true });
+  var now = Date.now();
+  if(SHEET_SYNC.acctAt && now - SHEET_SYNC.acctAt < 60000) return Promise.resolve({ ok:false, skipped:true });
+  SHEET_SYNC.acctAt = now;
+  return syncUsersFromSheet({ seed:(CUR.id === 'admin'), quiet:true }).then(function(r){
+    syncAfterApply(r);
+    return r;
+  });
 }
 function syncUsersFromSheet(opts){
   opts = opts || {};
   if(opts.seed) SHEET_SYNC.seed = true;
+  if(opts.quiet) SHEET_SYNC.quiet = true;
   if(SHEET_SYNC.promise) return SHEET_SYNC.promise;
   SHEET_SYNC.state = 'loading';
   SHEET_SYNC.last = Date.now();
@@ -1494,6 +1571,7 @@ function syncUsersFromSheet(opts){
   }).then(function(r){
     SHEET_SYNC.promise = null; SHEET_SYNC.seed = false;
     syncStateNote();
+    SHEET_SYNC.quiet = false;
     return r;
   });
   SHEET_SYNC.promise = p;
@@ -1541,6 +1619,7 @@ function addUser(id, name, pw){
   if(findUser(nid)) return { ok:false, msg:'이미 있는 아이디입니다' };
   if(String(pw || '').length < 4) return { ok:false, msg:'비밀번호는 4자 이상으로 넣어 주세요' };
   var d = usersDoc(), salt = newSalt();
+  d.deletedIds = deletedIdsOf(d).filter(function(x){ return normId(x) !== nid; });
   d.users.push({ id:nid, name:String(name || '').trim().slice(0,20) || nid, role:'user', salt:salt, hash:hashPw(pw, salt), createdAt:Date.now(), mustChange:true });
   saveUsers(d);
   var u = findUser(nid);
@@ -1571,6 +1650,12 @@ function deleteUser(id){
   d.users.forEach(function(u){ if(u.id === nid) hit = u; else rest.push(u); });
   if(!hit) return { ok:false, msg:'없는 사용자입니다' };
   d.users = rest; saveUsers(d);
+  /* admin 이 실제로 지운 계정은 deletedIds 에 남겨 다른 기기에서도 그 계정만 지우게 한다 */
+  var del = {};
+  deletedIdsOf(d).forEach(function(x){ var n2 = normId(x); if(n2) del[n2] = 1; });
+  del[nid] = 1;
+  d.deletedIds = Object.keys(del).filter(function(x){ return x && x !== 'admin'; });
+  saveUsers(d);
   pushUsersToSheet({ full:true });
   try{
     var kill = [], p = 'att.u.' + nid + '.';
@@ -3059,6 +3144,7 @@ function startApp(u){
   renderAccountChip();
   document.body.classList.remove('locked');
   document.documentElement.setAttribute('data-app-ready', '1');
+  syncSessionAccount();                       /* 로그인된 세션이어도 시트 계정 이름·권한을 조용히 한 번 확인한다 */
 }
 function bindAuth(){
   $('#login-form').addEventListener('submit', function(e){
@@ -3145,7 +3231,13 @@ if(sessionUser){
   showGate(gateMsg);
 }
 // 공용 계정: 화면이 열리면 조용히 한 번 시트에서 계정을 받아 둔다
-syncUsersFromSheet({ seed: !!(sessionUser && sessionUser.id === 'admin') }).then(syncAfterApply);
+if(!sessionUser) syncUsersFromSheet({ seed:false }).then(syncAfterApply);
+/* 앱으로 다시 돌아오면 시트 계정 이름·권한을 다시 확인한다 (60초 스로틀) */
+document.addEventListener('visibilitychange', function(){
+  if(document.visibilityState !== 'visible') return;
+  if(document.body.classList.contains('locked')) return;
+  syncSessionAccount();
+});
 window.__attendance = {
   get state(){ return state; },
   get user(){ return CUR; },
