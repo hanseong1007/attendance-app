@@ -1031,7 +1031,7 @@ function unlockSeed(kseed){
   SEED.spec = spec; SEED.key = kseed; SEED.ok = true;
   return true;
 }
-function seedWrapKeys(uid){ var p = 'att.u.' + uid + '.'; return { mat:p + 'seedwrap.v1', pw:p + 'seedwrap.pw.v1' }; }
+function seedWrapKeys(uid){ var p = 'att.u.' + (isAdminId(uid) ? 'admin' : uid) + '.'; return { mat:p + 'seedwrap.v1', pw:p + 'seedwrap.pw.v1' }; }
 function saveSeedWrap(u, kseed){
   if(!u || !kseed) return;
   LS.set(seedWrapKeys(u.id).mat, { v:1, salt:u.salt, ct:wrapKeyHex(kseed, matKeyHex(u.salt, u.hash)) });
@@ -1048,21 +1048,23 @@ function unlockSeedForUser(u, pw){
   W = LS.get(seedWrapKeys(u.id).mat, null);
   if(W && W.salt && W.ct) k = unwrapKeyHex(W.ct, matKeyHex(W.salt, u.hash));
   if(!k && W && W.salt && W.ct && u.prevHash) k = unwrapKeyHex(W.ct, matKeyHex(W.salt, u.prevHash));   /* 시트 계정으로 맞추기 전 비밀번호 */
-  if(!k && u.id === 'admin' && pw) k = unwrapKeyHex(SEED_WRAP.ct, pwKeyHex(SEED_WRAP.salt, pw));
-  if(!k && u.id === 'admin' && pw){
+  if(!k && isAdminId(u.id) && pw) k = unwrapKeyHex(SEED_WRAP.ct, pwKeyHex(SEED_WRAP.salt, pw));
+  if(!k && isAdminId(u.id) && pw){
     W = LS.get(seedWrapKeys(u.id).pw, null);
     if(W && W.salt && W.ct) k = unwrapKeyHex(W.ct, pwKeyHex(W.salt, pw));
   }
   // 암호화 전에 쓰던 기기 복구: 관리자로 로그인은 됐는데 열쇠가 없으면 처음 비밀번호로 감싼 열쇠를 한 번 쓴다.
-  if(!k && u.id === 'admin' && pw) k = unwrapKeyHex(SEED_WRAP.ct, pwKeyHex(SEED_WRAP.salt, DEFAULT_ADMIN_PW));
+  if(!k && isAdminId(u.id) && pw) k = unwrapKeyHex(SEED_WRAP.ct, pwKeyHex(SEED_WRAP.salt, DEFAULT_ADMIN_PW));
   if(!k || !unlockSeed(k)) return '';
   saveSeedWrap(u, k);
-  if(u.id === 'admin' && pw) saveSeedPwWrap(u, k, pw);
+  if(isAdminId(u.id) && pw) saveSeedPwWrap(u, k, pw);
   return k;
 }
 
 /* ===== 사용자 문서 ===== */
 function normId(id){ return String(id || '').trim().toLowerCase(); }
+/* 관리자 계정 아이디 — 2026-11-27 phs7604 로 바꿨고, 옛 admin 도 같은 관리자로 본다 */
+function isAdminId(id){ var n = normId(id); return n === 'admin' || n === 'phs7604'; }
 function noAdminSeed(){ return LS.get(NOSEED, false) === true; }
 function usersDoc(){
   var d = LS.get(UKEY, null);
@@ -1072,7 +1074,7 @@ function usersDoc(){
   for(var i=0;i<d.users.length;i++){
     d.users[i].id = normId(d.users[i].id);
     if(!d.users[i].name) d.users[i].name = d.users[i].id;
-    if(d.users[i].id === 'admin'){ d.users[i].role = 'admin'; hasAdmin = true; }
+    if(isAdminId(d.users[i].id)){ d.users[i].role = 'admin'; hasAdmin = true; }
     else d.users[i].role = 'user';
   }
   if(!hasAdmin && !noAdminSeed()){
@@ -1089,7 +1091,7 @@ function findUser(id){
   for(var i=0;i<d.users.length;i++){ if(d.users[i].id === nid) return d.users[i]; }
   return null;
 }
-function isAdmin(){ return !!(CUR && CUR.role === 'admin' && CUR.id === 'admin'); }
+function isAdmin(){ return !!(CUR && CUR.role === 'admin' && isAdminId(CUR.id)); }
 
 /* ===== 세션 ===== */
 function readSession(){
@@ -1102,8 +1104,8 @@ function readSession(){
 }
 function writeSession(u, keep){
   var s = { userId:u.id, ts:Date.now(), name:(u.name || u.id),
-            role:(u.id === 'admin' ? 'admin' : 'user'),
-            apprRole:(u.id === 'admin' ? 'all' : (u.sheetApprRole || u.apprRole || 'staff')) };
+            role:(isAdminId(u.id) ? 'admin' : 'user'),
+            apprRole:(isAdminId(u.id) ? 'all' : (u.sheetApprRole || u.apprRole || 'staff')) };
   try{ window.sessionStorage.removeItem(TKEY); }catch(e){}
   LS.remove(SKEY);
   if(keep){ LS.set(SKEY, s); }
@@ -1189,7 +1191,7 @@ function inviteUrl(ids){
   var d = usersDoc(), list = [];
   var seedKey = SEED.ok ? SEED.key : '';
   d.users.forEach(function(u){
-    if(u.id === 'admin') return;                      // 관리자 계정은 링크에 담지 않는다
+    if(isAdminId(u.id)) return;                       // 관리자 계정은 링크에 담지 않는다
     if(ids && ids.indexOf(u.id) === -1) return;
     // 예시 자료 열쇠도 그 직원의 비밀번호(salt+hash)로 감싸 함께 보낸다
     var seed = seedKey ? { s:u.salt, c:wrapKeyHex(seedKey, matKeyHex(u.salt, u.hash)) } : null;
@@ -1220,7 +1222,7 @@ function importInvite(token){
   if(fresh && incoming.length) LS.set(NOSEED, true);
   var d = usersDoc(), added = [], kept = [];
   incoming.forEach(function(u){
-    if(u.id === 'admin'){ kept.push('admin'); return; }      // admin 은 언제나 이 기기 것을 그대로 둔다
+    if(isAdminId(u.id)){ kept.push('admin'); return; }       // 관리자 계정은 언제나 이 기기 것을 그대로 둔다
     if(findUser(u.id)){ kept.push(u.id); return; }           // 이미 있는 계정은 비밀번호를 덮어쓰지 않는다
     d.users.push({ id:u.id, name:u.name, role:'user', salt:u.salt, hash:u.hash, createdAt:u.createdAt, mustChange:true });
     added.push(u.id);
@@ -1228,7 +1230,7 @@ function importInvite(token){
   saveUsers(d);
   // 초대 링크에 실린 예시 자료 열쇠를 이 기기의 그 계정 자리에 넣는다 (계정마다 따로 보관)
   incoming.forEach(function(u){
-    if(!u.seed || u.id === 'admin') return;
+    if(!u.seed || isAdminId(u.id)) return;
     var acc = findUser(u.id);
     if(!acc || acc.salt !== u.seed.s) return;      // 이 기기 계정의 비밀번호와 짝이 맞을 때만
     LS.set(seedWrapKeys(u.id).mat, { v:1, salt:u.seed.s, ct:u.seed.c });
@@ -1339,9 +1341,9 @@ function syncRecordOf(u){
     for(k in u.sheetHashes){ if(SYNC_PFX[k] && u.sheetHashes[k]){ hs[k] = String(u.sheetHashes[k]); any = true; } }
   }
   if(!hs[SYNC_APP] && salt && u.hash && (!u.sheetSalt || u.sheetSalt === u.salt)){ hs[SYNC_APP] = u.hash; any = true; }
-  var ar = (u.id === 'admin') ? 'all' : (u.sheetApprRole || u.apprRole || 'staff');
-  if(ar !== 'chief' && ar !== 'ceo') ar = (u.id === 'admin' ? 'all' : 'staff');
-  var rec = { id:u.id, name:u.name || u.id, role:(u.id === 'admin' ? 'admin' : 'user'),
+  var ar = (isAdminId(u.id)) ? 'all' : (u.sheetApprRole || u.apprRole || 'staff');
+  if(ar !== 'chief' && ar !== 'ceo') ar = (isAdminId(u.id) ? 'all' : 'staff');
+  var rec = { id:u.id, name:u.name || u.id, role:(isAdminId(u.id) ? 'admin' : 'user'),
               apprRole: ar, salt:salt, hash:(hs[SYNC_APP] || ''),
               active:(u.active !== false), mustChange:(u.mustChange === true),
               createdAt:(u.createdAt || 0), hashApp:SYNC_APP };
@@ -1448,9 +1450,9 @@ function syncApplyRec(rec, id){
   }
   var name = String(rec.name || id).slice(0, 20);
   /* '관리자' 는 앱이 쓰는 기본 자리표시 이름 — 시트가 그 이름으로 덮여 있어도 실제 이름을 지우지 않는다 */
-  if(id === 'admin' && name === '관리자' && u.name && u.name !== '관리자') name = u.name;
+  if(isAdminId(id) && name === '관리자' && u.name && u.name !== '관리자') name = u.name;
   if(u.name !== name){ u.name = name; changed = true; }
-  var ar = (id === 'admin') ? 'all' : (rec.apprRole === 'chief' || rec.apprRole === 'ceo' || rec.apprRole === 'all') ? rec.apprRole : 'staff';
+  var ar = (isAdminId(id)) ? 'all' : (rec.apprRole === 'chief' || rec.apprRole === 'ceo' || rec.apprRole === 'all') ? rec.apprRole : 'staff';
   if(u.sheetApprRole !== ar){ u.sheetApprRole = ar; changed = true; }
   if(rec.active === false){ u.active = false; } else if('active' in u){ delete u.active; }
   if(rec.mustChange !== undefined && (!!u.mustChange) !== (!!rec.mustChange)){ u.mustChange = !!rec.mustChange; changed = true; }
@@ -1486,10 +1488,10 @@ function syncApplyDoc(doc){
   if(!fresh){
     /* admin 이 deletedIds 에 넣어 실제로 지운 계정만 지운다 (시트에 없다는 이유로 로컬 계정을 지우지 않는다) */
     var delIds = {};
-    (Array.isArray(doc.deletedIds) ? doc.deletedIds : []).forEach(function(x){ var n = normId(x); if(n && n !== 'admin') delIds[n] = 1; });
+    (Array.isArray(doc.deletedIds) ? doc.deletedIds : []).forEach(function(x){ var n = normId(x); if(n && !isAdminId(n)) delIds[n] = 1; });
     var d = usersDoc(), out = [], gone = 0;
     d.users.forEach(function(u){
-      if(u.id === 'admin'){ out.push(u); return; }
+      if(isAdminId(u.id)){ out.push(u); return; }
       if(delIds[u.id]){ gone++; return; }
       out.push(u);
     });
@@ -1510,7 +1512,8 @@ function syncApplyDoc(doc){
 function syncCanSeed(){
   var d = usersDoc();
   if(d.users.length >= 2) return true;
-  var a = findUser('admin');
+  var a = null, aa = usersDoc().users;
+  for(var ai=0; ai<aa.length; ai++){ if(isAdminId(aa[ai].id)){ a = aa[ai]; break; } }
   if(!a || !a.salt || !a.hash) return false;
   return hashPw(DEFAULT_ADMIN_PW, a.salt) !== a.hash;
 }
@@ -1536,8 +1539,8 @@ function syncAfterApply(res){
 /* 세션 기록(session · kd.portal.sso.v1)에 남은 이름·권한을 시트 값으로 맞춘다 */
 function syncSessionLabels(u){
   if(!u) return;
-  var nm = u.name || u.id, ro = (u.id === 'admin' ? 'admin' : 'user'),
-      ar = (u.id === 'admin' ? 'all' : (u.sheetApprRole || u.apprRole || 'staff')), s, k, ss;
+  var nm = u.name || u.id, ro = (isAdminId(u.id) ? 'admin' : 'user'),
+      ar = (isAdminId(u.id) ? 'all' : (u.sheetApprRole || u.apprRole || 'staff')), s, k, ss;
   try{ s = JSON.parse(window.sessionStorage.getItem(TKEY) || 'null'); }catch(e){ s = null; }
   if(s && s.userId === u.id && (s.name !== nm || s.role !== ro || s.apprRole !== ar)){
     s.name = nm; s.role = ro; s.apprRole = ar;
@@ -1557,8 +1560,8 @@ function syncRefreshIdentity(){
   if(!CUR) return false;
   var u = findUser(CUR.id);
   if(!u) return false;
-  var arFormer = CUR.id === 'admin' ? 'all' : (CUR.sheetApprRole || CUR.apprRole || 'staff');
-  var arNow = u.id === 'admin' ? 'all' : (u.sheetApprRole || u.apprRole || 'staff');
+  var arFormer = isAdminId(CUR.id) ? 'all' : (CUR.sheetApprRole || CUR.apprRole || 'staff');
+  var arNow = isAdminId(u.id) ? 'all' : (u.sheetApprRole || u.apprRole || 'staff');
   var changed = ((CUR.name || CUR.id) !== (u.name || u.id)) ||
                 (arFormer !== arNow) ||
                 (CUR.role !== u.role) ||
@@ -1579,7 +1582,7 @@ function syncSessionAccount(){
   var now = Date.now();
   if(SHEET_SYNC.acctAt && now - SHEET_SYNC.acctAt < 60000) return Promise.resolve({ ok:false, skipped:true });
   SHEET_SYNC.acctAt = now;
-  return syncUsersFromSheet({ seed:(CUR.id === 'admin'), quiet:true }).then(function(r){
+  return syncUsersFromSheet({ seed:(isAdminId(CUR.id)), quiet:true }).then(function(r){
     syncAfterApply(r);
     return r;
   });
@@ -1681,7 +1684,7 @@ function addUser(id, name, pw){
 function resetPassword(id, pw){
   if(!isAdmin()) return { ok:false, msg:'관리자만 비밀번호를 재설정할 수 있습니다' };
   var nid = normId(id);
-  if(nid === 'admin') return { ok:false, msg:'관리자 비밀번호는 내 계정에서 바꿔 주세요' };
+  if(isAdminId(nid)) return { ok:false, msg:'관리자 비밀번호는 내 계정에서 바꿔 주세요' };
   if(String(pw || '').length < 4) return { ok:false, msg:'새 비밀번호는 4자 이상으로 넣어 주세요' };
   var d = usersDoc(), hit = null;
   for(var i=0;i<d.users.length;i++){ if(d.users[i].id === nid){ hit = d.users[i]; break; } }
@@ -1696,7 +1699,7 @@ function resetPassword(id, pw){
 function deleteUser(id){
   if(!isAdmin()) return { ok:false, msg:'관리자만 사용자를 삭제할 수 있습니다' };
   var nid = normId(id);
-  if(nid === 'admin') return { ok:false, msg:'관리자는 삭제할 수 없습니다' };
+  if(isAdminId(nid)) return { ok:false, msg:'관리자는 삭제할 수 없습니다' };
   var d = usersDoc(), hit = null, rest = [];
   d.users.forEach(function(u){ if(u.id === nid) hit = u; else rest.push(u); });
   if(!hit) return { ok:false, msg:'없는 사용자입니다' };
@@ -1705,7 +1708,7 @@ function deleteUser(id){
   var del = {};
   deletedIdsOf(d).forEach(function(x){ var n2 = normId(x); if(n2) del[n2] = 1; });
   del[nid] = 1;
-  d.deletedIds = Object.keys(del).filter(function(x){ return x && x !== 'admin'; });
+  d.deletedIds = Object.keys(del).filter(function(x){ return x && !isAdminId(x); });
   saveUsers(d);
   pushUsersToSheet({ full:true });
   try{
@@ -1733,7 +1736,7 @@ function changeOwnPassword(curPw, newPw){
   CUR = findUser(CUR.id);
   if(SEED.ok && SEED.key){
     saveSeedWrap(CUR, SEED.key);                  // 새 비밀번호(hash)에 맞춰 다시 감싼다
-    if(CUR.id === 'admin') saveSeedPwWrap(CUR, SEED.key, newPw);
+    if(isAdminId(CUR.id)) saveSeedPwWrap(CUR, SEED.key, newPw);
   }
   syncSetCredsById(CUR.id, newPw);
   CUR = findUser(CUR.id);
@@ -3107,7 +3110,7 @@ function renderUsers(){
   var d = usersDoc(), html = [];
   d.users.forEach(function(u){
     var me = CUR && CUR.id === u.id;
-    var admin = u.id === 'admin';
+    var admin = isAdminId(u.id);
     html.push('<div class="urow' + (me ? ' me' : '') + '" data-uid="' + esc(u.id) + '">' +
       '<div class="ut"><b>' + esc(u.name || u.id) + '</b><span class="uid">' + esc(u.id) + '</span>' +
         '<span class="tag2' + (admin ? '' : ' gray') + '">' + (admin ? '관리자' : '직원') + '</span>' +
@@ -3218,7 +3221,7 @@ function bindAuth(){
       }
       msg.className = 'authmsg ok'; msg.textContent = '';
       startApp(r.user);
-      if(r.user.id === 'admin') syncSelfHeal(r.user, pw).then(function(){ return syncUsersFromSheet({ seed:true }); });
+      if(isAdminId(r.user.id)) syncSelfHeal(r.user, pw).then(function(){ return syncUsersFromSheet({ seed:true }); });
       else syncSelfHeal(r.user, pw);
       if(r.locked) toast('예시 자료가 잠겨 있습니다 · 관리자에게 새 초대 링크를 받아 주세요');
       else if(r.user.mustChange) toast('처음 비밀번호입니다 · 내 계정에서 바꿔 주세요');
