@@ -441,6 +441,7 @@ body.locked .authgate{display:block}
 </style>
 </head>
 <body class="locked">
+<script src="/sec.js"></script>
 
 <!-- ============ 로그인 게이트 ============ -->
 <div class="authgate" id="auth-gate" role="main" aria-label="로그인">
@@ -1165,6 +1166,7 @@ function tryLogin(id, pw, keep){
   return { ok:true, user:u, locked:!k };
 }
 function logout(){
+  try{ if(kdsec()) kdsec().logout({ silent:true }); }catch(e){}
   clearSession();
   clearPortalSSO();
   CUR = null;
@@ -1275,23 +1277,39 @@ function syncStateNote(){
   else syncNote('');
 }
 function syncFetch(payload){
+  var body = withSecToken(payload);
   return fetch(SYNC_URL, {
     method:'POST', cache:'no-store', redirect:'follow',
     headers:{ 'Content-Type':'text/plain;charset=utf-8' },
-    body: JSON.stringify(payload)
+    body: JSON.stringify(body)
   }).then(function(r){
     if(!r.ok) throw new Error('HTTP ' + r.status);
     return r.text();
   }).then(function(t){
     var j = null;
     try{ j = JSON.parse(t); }catch(e){ throw new Error('시트 응답을 읽지 못했습니다'); }
+    if(j && j.needLogin) throw new Error('로그인이 필요합니다');
     if(!j || j.ok !== true) throw new Error((j && (j.error || j.message)) || '시트가 요청을 처리하지 못했습니다');
     return j;
   });
 }
+/* 서버 세션 토큰을 요청에 붙인다 (2026-11-27 보안 강화) */
+function withSecToken(payload){
+  var out = {}, k;
+  for(k in payload){ out[k] = payload[k]; }
+  try{
+    if(window.KDWSEC){
+      var t = KDWSEC.token();
+      if(t) out.token = t;
+      out.ua = (navigator.userAgent || '').slice(0, 90);
+    }
+  }catch(e){}
+  return out;
+}
+function kdsec(){ return window.KDWSEC || null; }
 
 /* 포털에서 정한 메뉴(발주 order · 업무일지 worklog · 근태 attendance) — 이 앱은 값을 그대로 보존만 한다 */
-var SYNC_MENU_KEYS = ['order', 'worklog', 'attendance', 'parcel', 'coupang', 'price', 'shop'];
+var SYNC_MENU_KEYS = ['order', 'worklog', 'attendance', 'parcel', 'coupang', 'price', 'shop', 'raw', 'prod'];
 function syncNormMenus(list){
   if(!Array.isArray(list)) return null;
   var pick = [], i, k;
@@ -3168,6 +3186,8 @@ function showGate(msg){
 }
 function startApp(u){
   CUR = u;
+  var SEC = kdsec();
+  if(SEC && SEC.needChange()){ SEC.forceChange({ onDone:function(){ location.reload(); } }); }
   if(!SEED.ok) unlockSeedForUser(u, '');      // 이 기기에 감춰 둔 열쇠로 예시 자료를 연다
   loadState();
   refreshAutoAllowances();                    // 자동 방식 직원의 부여일수를 오늘·기준연도에 맞춘다
@@ -3203,7 +3223,19 @@ function bindAuth(){
       if(r.locked) toast('예시 자료가 잠겨 있습니다 · 관리자에게 새 초대 링크를 받아 주세요');
       else if(r.user.mustChange) toast('처음 비밀번호입니다 · 내 계정에서 바꿔 주세요');
     };
-    run(false);
+    var S = kdsec();
+    if(!S){ run(false); return; }
+    msg.className = 'authmsg ok'; msg.textContent = '보안 서버에서 확인 중…';
+    S.login(id, pw, { app:'attendance' }).then(function(j){
+      if(!j || j.ok !== true){
+        msg.className = 'authmsg'; msg.textContent = S.loginMessage(j);
+        $('#login-pw').value = ''; $('#login-pw').focus(); return;
+      }
+      msg.className = 'authmsg ok'; msg.textContent = '';
+      run(false);
+    }).catch(function(){
+      msg.className = 'authmsg'; msg.textContent = '보안 서버에 연결하지 못했습니다 · 잠시 뒤 다시 시도해 주세요';
+    });
   });
   $('#btn-pw-help').addEventListener('click', function(){
     var m = $('#login-msg');
@@ -3247,6 +3279,13 @@ bindAuth();
 document.documentElement.setAttribute('data-auth-ready', '1');
 var inviteResult = handleInviteHash();
 var sessionUser = readSession() || readPortalSSO();
+/* 보안(2026-11-27): 서버 토큰이 없거나 이 화면 권한이 없으면 포털 로그인으로 */
+(function(){
+  var SEC = kdsec();
+  if(!SEC) return;
+  if(!SEC.guard('attendance')) return;
+  if(sessionUser && !SEC.session()){ clearSession(); sessionUser = null; }
+})();
 if(sessionUser){
   startApp(sessionUser);
   if(inviteResult && inviteResult.added && inviteResult.added.length){
