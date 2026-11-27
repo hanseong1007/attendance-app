@@ -1356,7 +1356,10 @@ function syncRecordOf(u){
 }
 function syncLocalDoc(){
   var d = usersDoc(), users = [];
-  d.users.forEach(function(u){ if(u && u.id) users.push(syncRecordOf(u)); });
+  /* 지운 계정(옛 admin 등)은 시트로 다시 올리지 않는다 */
+  var gone = {};
+  deletedIdsOf(d).forEach(function(x){ var n = normId(x); if(n) gone[n] = 1; });
+  d.users.forEach(function(u){ if(u && u.id && !gone[u.id]) users.push(syncRecordOf(u)); });
   return { v:1, updatedAt:'', kcat:(LS.get(SYNC_KCAT_KEY, '') || ''), users:users, deletedIds:deletedIdsOf(d) };
 }
 /* admin 이 실제로 지운 계정 목록 — 시트에 함께 올려 다른 기기도 그 계정만 지우게 한다 */
